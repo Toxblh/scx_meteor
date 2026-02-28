@@ -3927,7 +3927,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "scx_meteor_v2"
+name = "scx_meteor"
 version = "0.1.0"
 dependencies = [
  "anyhow",

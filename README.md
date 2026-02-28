@@ -2,7 +2,25 @@
 
 This is a **fork of SCX (sched_ext)** tailored for Intel Meteor Lake, specifically the **Core Ultra 9 185H**. It implements a 3-tier scheduler aware of LP E-cores (SoC tile), E-cores, and P-cores (Compute tile), with an **LP‑first, burst‑up, drain‑back** strategy and persistent per‑process profiling.
 
-## Overview (English)
+## Build & Run
+
+Build:
+```bash
+cd scx
+cargo build -p scx_meteor
+```
+
+Run (example):
+```bash
+sudo ./target/debug/scx_meteor --stats 1
+```
+
+Debug (BPF trace):
+```bash
+sudo ./target/debug/scx_meteor -D
+sudo cat /sys/kernel/tracing/trace_pipe
+```
+## Overview
 
 ### Core tiers
 - **LP E-cores (SoC tile)**: low-power island, no L3; best for background and idle work.
@@ -81,6 +99,26 @@ This is a **fork of SCX (sched_ext)** tailored for Intel Meteor Lake, specifical
 ## Русский
 
 Этот репозиторий — **форк SCX (sched_ext)** под Intel Meteor Lake, конкретно **Core Ultra 9 185H**. Планировщик знает о 3 типах ядер и оптимизирован под энергоэффективность на SoC‑tile.
+
+
+## Сборка и запуск (Русский)
+
+Сборка:
+```bash
+cd scx
+cargo build -p scx_meteor
+```
+
+Запуск (пример):
+```bash
+sudo ./target/debug/scx_meteor --stats 1
+```
+
+Отладка (BPF trace):
+```bash
+sudo ./target/debug/scx_meteor -D
+sudo cat /sys/kernel/tracing/trace_pipe
+```
 
 ### Политика
 - Новые задачи стартуют на **LP**.
