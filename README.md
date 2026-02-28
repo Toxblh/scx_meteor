@@ -1,5 +1,7 @@
 # SCX Meteor Lake Fork — Core Ultra 9 185H (i9 185H)
 
+[Русский](#русский)
+
 This is a **fork of SCX (sched_ext)** tailored for Intel Meteor Lake, specifically the **Core Ultra 9 185H**. It implements a 3-tier scheduler aware of LP E-cores (SoC tile), E-cores, and P-cores (Compute tile), with an **LP‑first, burst‑up, drain‑back** strategy and persistent per‑process profiling.
 
 ## Build & Run
@@ -44,6 +46,36 @@ sudo cat /sys/kernel/tracing/trace_pipe
 
 ### Procdb
 - Stored at: `~/.config/scx-meteor/profiles.db`
+
+## Scheduler Timeline (ASCII)
+
+```
+[T0] | LP  Task starts on LP cores.
+--------------------------
+     ├ interactive_wakeup_freq (10/100ms): if it wakes a lot, treat as interactive.
+     ├ interactive_csw_rate (50/s): if it switches a lot, treat as interactive.
+     ├ lp_only_load_pct (10%): below this load, keep everything on LP.
+     ├ lp_only_hyst_pct (5%): extra margin before leaving LP-only.
+     └ strict_lp (true): don't let LP tasks run on E/P.
+
+[T1] | *LP* Escalate to E cores.
+--------------------------
+     ├ lp_burst_ms (5ms): burst time to move **LP → E**.
+     ├ burst_up_streak (2): how many bursts in a row are needed.
+     └ fast_burst_ms (10ms): faster escalation for first-run bursts.
+
+[T2] | *E* Escalate to P cores.
+--------------------------
+     ├ e_burst_ms (30ms): burst time to move **E → P**.
+     └ burst_up_streak (2): how many bursts in a row are needed.
+
+[T3] | *P/E* Drain back down.
+--------------------------
+     ├ drain_delay_ms (500ms): wait this long before dropping a tier.
+     ├ bursty_window_ms (500ms): window to detect bursty patterns.
+     ├ bursty_threshold (3): bursts in window to keep tier.
+     └ bursty_hold_ms (1000ms): keep ≥E for this long after bursty.
+```
 
 ## Scheduler Flags (English)
 
@@ -137,3 +169,33 @@ sudo cat /sys/kernel/tracing/trace_pipe
 
 ### Procdb
 - Путь: `~/.config/scx-meteor/profiles.db`
+
+## Таймлайн параметров (ASCII)
+
+```
+[T0] | LP  Задача стартует на LP ядрах.
+--------------------------
+     ├ interactive_wakeup_freq (10/100мс): если часто просыпается — интерактив.
+     ├ interactive_csw_rate (50/с): если много ctx-switch — интерактив.
+     ├ lp_only_load_pct (10%): ниже этой нагрузки всё держим на LP.
+     ├ lp_only_hyst_pct (5%): запас перед выходом из LP-only.
+     └ strict_lp (true): LP‑задачи не уходят на E/P.
+
+[T1] | *LP* Эскалация на E ядра.
+--------------------------
+     ├ lp_burst_ms (5мс): порог бурста для **LP → E**.
+     ├ burst_up_streak (2): сколько подряд бурстов нужно.
+     └ fast_burst_ms (10мс): ускоренное окно на первом запуске.
+
+[T2] | *E* Эскалация на P ядра.
+--------------------------
+     ├ e_burst_ms (30мс): порог бурста для **E → P**.
+     └ burst_up_streak (2): сколько подряд бурстов нужно.
+
+[T3] | *P/E* Слив обратно вниз.
+--------------------------
+     ├ drain_delay_ms (500мс): ждём перед понижением.
+     ├ bursty_window_ms (500мс): окно для bursty.
+     ├ bursty_threshold (3): бурстов в окне для удержания.
+     └ bursty_hold_ms (1000мс): держим ≥E после bursty.
+```
