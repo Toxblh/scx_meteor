@@ -116,6 +116,12 @@ const volatile u64 bursty_window_ns     = 500000000ULL; /* 500 ms */
 const volatile u32 bursty_threshold     = 3;
 const volatile u64 bursty_hold_ns       = 1000000000ULL;/* 1 s */
 
+/* Waker-wakee: how long a transitive tier boost lasts (ns) */
+const volatile u64 waker_boost_ns       = 5000000ULL;  /* 5 ms */
+
+/* Working set: minor fault rate above this → task is WS-heavy, not LP */
+const volatile u64 ws_fault_rate_thresh = 1000;         /* faults/sec */
+
 /* ------------------------------------------------------------------ */
 /* CPU topology (set by userspace on init)                            */
 /* ------------------------------------------------------------------ */
@@ -191,6 +197,10 @@ struct task_ctx {
 	u32 bursty_count;   /* bursts within current window          */
 	u64 bursty_window_start; /* window start timestamp           */
 	u8  procdb_loaded;  /* initial tier came from procdb         */
+	u8  waker_tier;     /* tier of the last sync waker           */
+	u64 waker_boost_until; /* transitive boost expires at this ns */
+	u64 last_min_flt;   /* last observed p->min_flt value        */
+	u64 min_flt_rate;   /* EWMA minor faults per second          */
 };
 
 struct {
@@ -432,6 +442,21 @@ static inline u8 get_cpu_core_type(s32 cpu)
 }
 
 /* ------------------------------------------------------------------ */
+/* Helper: effective tier (applies waker-wakee transitive boost)      */
+/* ------------------------------------------------------------------ */
+static inline u8 effective_tier(struct task_ctx *tctx, u64 now)
+{
+	u8 tier = tctx->tier;
+
+	/* Waker-wakee transitive boost: if waker was E/P, boost wakee to E */
+	if (tctx->waker_boost_until > now && tctx->waker_tier >= TIER_E) {
+		if (tier < TIER_E)
+			tier = TIER_E;
+	}
+	return tier;
+}
+
+/* ------------------------------------------------------------------ */
 /* Find idle CPU in a tier's cpu list                                 */
 /* Tries prev_cpu first if it matches expected_core_type, then scans. */
 /* Returns ≥ 0 on success, -EBUSY if no idle CPU found.               */
@@ -441,6 +466,7 @@ static s32 pick_idle_cpu_in_list(struct task_struct *p, s32 prev_cpu,
 				 u8 expected_core_type)
 {
 	u32 max_iter = MIN(nr_list, (u32)MAX_CPUS);
+	const struct cpumask *idle_mask;
 	s32 first_idle = -EBUSY;
 	s32 best_cpu = -EBUSY;
 	u32 best_score = 0;
@@ -458,7 +484,12 @@ static s32 pick_idle_cpu_in_list(struct task_struct *p, s32 prev_cpu,
 			return prev_cpu;
 	}
 
-	/* Scan the tier's CPU list for any idle CPU */
+	/*
+	 * Read-only idle mask scan — no idle bits are cleared here.
+	 * Only the final chosen CPU is atomically claimed below.
+	 */
+	idle_mask = scx_bpf_get_idle_cpumask();
+
 	bpf_for(i, 0, max_iter) {
 		s32 cpu = (s32)cpu_list[i];
 		struct hfi_caps *hc;
@@ -468,18 +499,17 @@ static s32 pick_idle_cpu_in_list(struct task_struct *p, s32 prev_cpu,
 			continue;
 		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
 			continue;
-		if (scx_bpf_test_and_clear_cpu_idle(cpu))
-			goto consider_cpu;
-		continue;
+		if (!bpf_cpumask_test_cpu(cpu, idle_mask))
+			continue;
 
-consider_cpu:
 		if (first_idle < 0)
 			first_idle = cpu;
 
 		hc = get_hfi_caps(cpu);
 		if (hc && hc->valid) {
 			any_hfi = true;
-			score = (expected_core_type == CORE_LP) ? hc->eff : hc->perf;
+			/* LP/E → efficiency (work per watt), P → performance (race-to-idle) */
+			score = (expected_core_type == CORE_P) ? hc->perf : hc->eff;
 			if (score > best_score) {
 				best_score = score;
 				best_cpu = cpu;
@@ -487,11 +517,41 @@ consider_cpu:
 		}
 	}
 
-	if (any_hfi && best_cpu >= 0)
-		return best_cpu;
-	if (first_idle >= 0)
-		return first_idle;
+	scx_bpf_put_idle_cpumask(idle_mask);
+
+	/* Atomically claim the chosen CPU (may race — handled gracefully) */
+	if (any_hfi && best_cpu >= 0) {
+		if (scx_bpf_test_and_clear_cpu_idle(best_cpu))
+			return best_cpu;
+	}
+	if (first_idle >= 0) {
+		if (scx_bpf_test_and_clear_cpu_idle(first_idle))
+			return first_idle;
+	}
 	return -EBUSY;
+}
+
+/* ------------------------------------------------------------------ */
+/* Check whether a task is allowed to run on any LP core               */
+/* ------------------------------------------------------------------ */
+static __always_inline bool task_can_run_on_lp(struct task_struct *p)
+{
+	u32 max_iter = MIN(nr_lp_cpus, (u32)MAX_CPUS);
+	int i;
+
+	if (nr_lp_cpus == 0)
+		return false;
+
+	bpf_for(i, 0, max_iter) {
+		s32 cpu = (s32)lp_cpus[i];
+
+		if (cpu < 0 || cpu >= MAX_CPUS)
+			continue;
+		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			return true;
+	}
+
+	return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -702,6 +762,19 @@ static void update_tier(struct task_struct *p, struct task_ctx *tctx,
 	if (new_tier < TIER_E && now < tctx->bursty_until)
 		new_tier = TIER_E;
 
+	/* Working set: high minor fault rate → not LP (no L3 on SoC tile) */
+	if (new_tier == TIER_LP && tctx->min_flt_rate > ws_fault_rate_thresh &&
+	    tctx->observations > 10) {
+		new_tier = TIER_E;
+		dbg("meteor: ws-heavy %s LP→E flt_rate=%llu", p->comm,
+		    tctx->min_flt_rate);
+	}
+
+	/* Waker-wakee: transitive boost still active → keep at least E */
+	if (new_tier < TIER_E && tctx->waker_boost_until > now &&
+	    tctx->waker_tier >= TIER_E)
+		new_tier = TIER_E;
+
 	/* Respect minimum tier rule */
 	if (new_tier < tctx->min_tier)
 		new_tier = tctx->min_tier;
@@ -737,12 +810,24 @@ s32 BPF_STRUCT_OPS(meteor_select_cpu, struct task_struct *p,
 	if (!tctx)
 		return prev_cpu;
 
-	if (wake_flags & SCX_WAKE_SYNC)
+	if (wake_flags & SCX_WAKE_SYNC) {
+		struct task_struct *waker = bpf_get_current_task_btf();
+		struct task_ctx *waker_ctx = try_lookup_task_ctx(waker);
+
 		tctx->sync_wake = 1;
+		if (waker_ctx && waker_ctx->tier > tctx->tier &&
+		    !tctx->force_valid) {
+			tctx->waker_tier = waker_ctx->tier;
+			tctx->waker_boost_until =
+				bpf_ktime_get_ns() + waker_boost_ns;
+		}
+	}
 
 	update_lp_only_state();
-	tier = tctx->tier;
-	if (lp_only_active() && nr_lp_cpus > 0) {
+	tier = effective_tier(tctx, bpf_ktime_get_ns());
+	if (lp_only_active() && nr_lp_cpus > 0 &&
+	    !(p->flags & PF_KTHREAD) &&
+	    task_can_run_on_lp(p)) {
 		tier = TIER_LP;
 		__sync_fetch_and_add(&nr_lp_only_forced, 1);
 	}
@@ -800,7 +885,9 @@ void BPF_STRUCT_OPS(meteor_enqueue, struct task_struct *p, u64 enq_flags)
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx) {
 		update_lp_only_state();
-		if (lp_only_active() && nr_lp_cpus > 0) {
+		if (lp_only_active() && nr_lp_cpus > 0 &&
+		    !(p->flags & PF_KTHREAD) &&
+		    task_can_run_on_lp(p)) {
 			scx_bpf_dsq_insert(p, DSQ_LP, slice_ns, enq_flags);
 			__sync_fetch_and_add(&nr_lp_only_forced, 1);
 		} else {
@@ -816,8 +903,10 @@ void BPF_STRUCT_OPS(meteor_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	update_lp_only_state();
-	tier = tctx->tier;
-	if (lp_only_active() && nr_lp_cpus > 0) {
+	tier = effective_tier(tctx, bpf_ktime_get_ns());
+	if (lp_only_active() && nr_lp_cpus > 0 &&
+	    !(p->flags & PF_KTHREAD) &&
+	    task_can_run_on_lp(p)) {
 		tier = TIER_LP;
 		__sync_fetch_and_add(&nr_lp_only_forced, 1);
 	}
@@ -852,9 +941,6 @@ void BPF_STRUCT_OPS(meteor_dispatch, s32 cpu, struct task_struct *prev)
 
 	core_type = get_cpu_core_type(cpu);
 
-	if (lp_only_active() && core_type != CORE_LP)
-		return;
-
 	/* 2. Primary shared DSQ for this core type */
 	switch (core_type) {
 	case CORE_LP:
@@ -878,7 +964,7 @@ void BPF_STRUCT_OPS(meteor_dispatch, s32 cpu, struct task_struct *prev)
 		/* E-cores serve P-tier tasks if P-cores are busy */
 		if (scx_bpf_dsq_move_to_local(DSQ_P))
 			return;
-		if (!strict_lp) {
+		if (!strict_lp && !lp_only_active()) {
 			/* Anti-starvation: steal from LP DSQ if enabled */
 			if (scx_bpf_dsq_move_to_local(DSQ_LP))
 				return;
@@ -890,7 +976,7 @@ void BPF_STRUCT_OPS(meteor_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 		if (scx_bpf_dsq_move_to_local(DSQ_E))
 			return;
-		if (!strict_lp) {
+		if (!strict_lp && !lp_only_active()) {
 			/* Anti-starvation: steal from LP DSQ as last resort */
 			if (scx_bpf_dsq_move_to_local(DSQ_LP))
 				return;
@@ -961,6 +1047,20 @@ void BPF_STRUCT_OPS(meteor_stopping, struct task_struct *p, bool runnable)
 	}
 	tctx->last_nvcsw = nvcsw;
 	tctx->last_nvcsw_at = now;
+
+	/* Update minor fault rate (working set proxy) */
+	{
+		u64 faults = p->min_flt;
+		if (tctx->last_min_flt > 0 && faults > tctx->last_min_flt &&
+		    burst_ns > 0) {
+			u64 delta_flt = faults - tctx->last_min_flt;
+			u64 rate = (delta_flt * 1000000000ULL) / burst_ns;
+			if (rate > 0xffffffffULL)
+				rate = 0xffffffffULL;
+			tctx->min_flt_rate = ewma(tctx->min_flt_rate, rate);
+		}
+		tctx->last_min_flt = faults;
+	}
 
 	/* Update vruntime (for fairness accounting) */
 	delta_vtime = scale_by_task_weight_inverse(p, burst_ns);
@@ -1100,6 +1200,10 @@ s32 BPF_STRUCT_OPS(meteor_init_task, struct task_struct *p,
 	tctx->bursty_count    = 0;
 	tctx->bursty_window_start = 0;
 	tctx->procdb_loaded = 0;
+	tctx->waker_tier    = 0;
+	tctx->waker_boost_until = 0;
+	tctx->last_min_flt  = 0;
+	tctx->min_flt_rate  = 0;
 
 	return 0;
 }

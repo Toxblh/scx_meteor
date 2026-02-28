@@ -19,6 +19,7 @@ mod stats;
 use std::collections::HashMap;
 use std::fs;
 use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +42,375 @@ use scx_utils::{
 use scx_utils::{Topology, UserExitInfo};
 use serde::{Deserialize, Serialize};
 use stats::Metrics;
+
+// ---------------------------------------------------------------------------
+// Thermal netlink: subscribe to HFI CPU capability change events
+// ---------------------------------------------------------------------------
+mod thermal_netlink {
+    use super::*;
+
+    // Netlink / genetlink constants
+    const NETLINK_GENERIC: libc::c_int = 16;
+    const GENL_ID_CTRL: u16 = 0x10;
+    const CTRL_CMD_GETFAMILY: u8 = 3;
+    const CTRL_ATTR_FAMILY_ID: u16 = 1;
+    const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+    const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+    const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
+    const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
+
+    // Thermal genetlink constants (from linux/thermal.h)
+    const THERMAL_GENL_EVENT_CPU_CAPABILITY_CHANGE: u8 = 10;
+    const THERMAL_GENL_ATTR_CPU_CAPABILITY: u16 = 15;
+    const THERMAL_GENL_ATTR_CPU_CAPABILITY_ID: u16 = 16;
+    const THERMAL_GENL_ATTR_CPU_CAPABILITY_PERFORMANCE: u16 = 17;
+    const THERMAL_GENL_ATTR_CPU_CAPABILITY_EFFICIENCY: u16 = 18;
+
+    const THERMAL_FAMILY_NAME: &[u8] = b"thermal\0";
+    const THERMAL_EVENT_GROUP: &[u8] = b"event\0";
+
+    const NLA_ALIGNTO: usize = 4;
+    fn nla_align(len: usize) -> usize {
+        (len + NLA_ALIGNTO - 1) & !(NLA_ALIGNTO - 1)
+    }
+
+    #[repr(C)]
+    struct NlMsgHdr {
+        nlmsg_len: u32,
+        nlmsg_type: u16,
+        nlmsg_flags: u16,
+        nlmsg_seq: u32,
+        nlmsg_pid: u32,
+    }
+
+    #[repr(C)]
+    struct GenlMsgHdr {
+        cmd: u8,
+        version: u8,
+        reserved: u16,
+    }
+
+    #[repr(C)]
+    struct NlAttr {
+        nla_len: u16,
+        nla_type: u16,
+    }
+
+    /// A single HFI capability update for one CPU.
+    pub struct HfiUpdate {
+        pub cpu: u32,
+        pub perf: u8,
+        pub eff: u8,
+    }
+
+    pub struct ThermalNetlink {
+        fd: OwnedFd,
+        family_id: u16,
+    }
+
+    impl ThermalNetlink {
+        /// Open a genetlink socket, resolve the "thermal" family, and join its
+        /// event multicast group.  Returns None if HFI netlink is unavailable.
+        pub fn open() -> Option<Self> {
+            // Create NETLINK_GENERIC socket (non-blocking)
+            let raw_fd = unsafe {
+                libc::socket(
+                    libc::AF_NETLINK,
+                    libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    NETLINK_GENERIC,
+                )
+            };
+            if raw_fd < 0 {
+                return None;
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+            // Bind
+            let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            addr.nl_family = libc::AF_NETLINK as u16;
+            let ret = unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_nl>() as u32,
+                )
+            };
+            if ret < 0 {
+                return None;
+            }
+
+            // Resolve "thermal" family
+            let (family_id, mcast_id) = Self::resolve_family(fd.as_raw_fd())?;
+
+            // Join the multicast group
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_NETLINK,
+                    libc::NETLINK_ADD_MEMBERSHIP,
+                    &mcast_id as *const _ as *const libc::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            };
+            if ret < 0 {
+                return None;
+            }
+
+            Some(ThermalNetlink { fd, family_id })
+        }
+
+        fn resolve_family(fd: libc::c_int) -> Option<(u16, u32)> {
+            // Build CTRL_CMD_GETFAMILY request
+            let name_bytes = THERMAL_FAMILY_NAME;
+            let nla_len = (std::mem::size_of::<NlAttr>() + name_bytes.len()) as u16;
+            let nla_padded = nla_align(nla_len as usize);
+
+            let total = std::mem::size_of::<NlMsgHdr>()
+                + std::mem::size_of::<GenlMsgHdr>()
+                + nla_padded;
+
+            let mut buf = vec![0u8; total];
+            let hdr = unsafe { &mut *(buf.as_mut_ptr() as *mut NlMsgHdr) };
+            hdr.nlmsg_len = total as u32;
+            hdr.nlmsg_type = GENL_ID_CTRL;
+            hdr.nlmsg_flags = libc::NLM_F_REQUEST as u16;
+            hdr.nlmsg_seq = 1;
+
+            let genl = unsafe {
+                &mut *(buf
+                    .as_mut_ptr()
+                    .add(std::mem::size_of::<NlMsgHdr>()) as *mut GenlMsgHdr)
+            };
+            genl.cmd = CTRL_CMD_GETFAMILY;
+            genl.version = 1;
+
+            let nla_off = std::mem::size_of::<NlMsgHdr>() + std::mem::size_of::<GenlMsgHdr>();
+            let nla = unsafe { &mut *(buf.as_mut_ptr().add(nla_off) as *mut NlAttr) };
+            nla.nla_len = nla_len;
+            nla.nla_type = CTRL_ATTR_FAMILY_NAME;
+            buf[nla_off + std::mem::size_of::<NlAttr>()
+                ..nla_off + std::mem::size_of::<NlAttr>() + name_bytes.len()]
+                .copy_from_slice(name_bytes);
+
+            // Send
+            let ret = unsafe {
+                libc::send(fd, buf.as_ptr() as *const _, buf.len(), 0)
+            };
+            if ret < 0 {
+                return None;
+            }
+
+            // Receive response
+            let mut resp = vec![0u8; 4096];
+            let n = unsafe {
+                libc::recv(fd, resp.as_mut_ptr() as *mut _, resp.len(), 0)
+            };
+            if n <= 0 {
+                return None;
+            }
+            let resp = &resp[..n as usize];
+
+            Self::parse_family_response(resp)
+        }
+
+        fn parse_family_response(resp: &[u8]) -> Option<(u16, u32)> {
+            let hdr_size = std::mem::size_of::<NlMsgHdr>();
+            let genl_size = std::mem::size_of::<GenlMsgHdr>();
+            if resp.len() < hdr_size + genl_size {
+                return None;
+            }
+
+            let mut family_id: Option<u16> = None;
+            let mut mcast_id: Option<u32> = None;
+
+            // Parse top-level NLA attrs
+            let attrs_start = hdr_size + genl_size;
+            let mut off = attrs_start;
+            while off + 4 <= resp.len() {
+                let nla = unsafe { &*(resp.as_ptr().add(off) as *const NlAttr) };
+                let len = nla.nla_len as usize;
+                if len < 4 || off + len > resp.len() {
+                    break;
+                }
+                let payload = &resp[off + 4..off + len];
+
+                match nla.nla_type & 0x7fff {
+                    CTRL_ATTR_FAMILY_ID if payload.len() >= 2 => {
+                        family_id = Some(u16::from_ne_bytes([payload[0], payload[1]]));
+                    }
+                    CTRL_ATTR_MCAST_GROUPS => {
+                        mcast_id = Self::parse_mcast_groups(payload);
+                    }
+                    _ => {}
+                }
+                off += nla_align(len);
+            }
+
+            Some((family_id?, mcast_id?))
+        }
+
+        fn parse_mcast_groups(data: &[u8]) -> Option<u32> {
+            // Nested: each group is a nested NLA containing name + id
+            let mut off = 0;
+            while off + 4 <= data.len() {
+                let nla = unsafe { &*(data.as_ptr().add(off) as *const NlAttr) };
+                let len = nla.nla_len as usize;
+                if len < 4 || off + len > data.len() {
+                    break;
+                }
+                let inner = &data[off + 4..off + len];
+
+                // Parse inner attrs for this group
+                let mut name: Option<&[u8]> = None;
+                let mut gid: Option<u32> = None;
+                let mut ioff = 0;
+                while ioff + 4 <= inner.len() {
+                    let inla = unsafe { &*(inner.as_ptr().add(ioff) as *const NlAttr) };
+                    let ilen = inla.nla_len as usize;
+                    if ilen < 4 || ioff + ilen > inner.len() {
+                        break;
+                    }
+                    let ipayload = &inner[ioff + 4..ioff + ilen];
+                    match inla.nla_type & 0x7fff {
+                        CTRL_ATTR_MCAST_GRP_NAME => name = Some(ipayload),
+                        CTRL_ATTR_MCAST_GRP_ID if ipayload.len() >= 4 => {
+                            gid = Some(u32::from_ne_bytes([
+                                ipayload[0],
+                                ipayload[1],
+                                ipayload[2],
+                                ipayload[3],
+                            ]));
+                        }
+                        _ => {}
+                    }
+                    ioff += nla_align(ilen);
+                }
+
+                if let (Some(n), Some(id)) = (name, gid) {
+                    if n.starts_with(b"event") {
+                        return Some(id);
+                    }
+                }
+                off += nla_align(len);
+            }
+            None
+        }
+
+        /// Try to receive HFI capability updates (non-blocking).
+        /// Returns an empty vec if no updates are available.
+        pub fn try_recv(&self) -> Vec<HfiUpdate> {
+            let mut buf = vec![0u8; 4096];
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n <= 0 {
+                return Vec::new();
+            }
+            let buf = &buf[..n as usize];
+            self.parse_capability_msg(buf)
+        }
+
+        fn parse_capability_msg(&self, buf: &[u8]) -> Vec<HfiUpdate> {
+            let hdr_size = std::mem::size_of::<NlMsgHdr>();
+            let genl_size = std::mem::size_of::<GenlMsgHdr>();
+            let mut updates = Vec::new();
+
+            if buf.len() < hdr_size + genl_size {
+                return updates;
+            }
+
+            let hdr = unsafe { &*(buf.as_ptr() as *const NlMsgHdr) };
+            if hdr.nlmsg_type != self.family_id {
+                return updates;
+            }
+
+            let genl = unsafe {
+                &*(buf.as_ptr().add(hdr_size) as *const GenlMsgHdr)
+            };
+            if genl.cmd != THERMAL_GENL_EVENT_CPU_CAPABILITY_CHANGE {
+                return updates;
+            }
+
+            // Parse nested CPU_CAPABILITY attrs
+            let mut off = hdr_size + genl_size;
+            while off + 4 <= buf.len() {
+                let nla = unsafe { &*(buf.as_ptr().add(off) as *const NlAttr) };
+                let len = nla.nla_len as usize;
+                if len < 4 || off + len > buf.len() {
+                    break;
+                }
+                let payload = &buf[off + 4..off + len];
+
+                if nla.nla_type & 0x7fff == THERMAL_GENL_ATTR_CPU_CAPABILITY {
+                    // Each CPU_CAPABILITY is nested with id/perf/eff
+                    if let Some(u) = Self::parse_one_capability(payload) {
+                        updates.push(u);
+                    }
+                }
+                off += nla_align(len);
+            }
+            updates
+        }
+
+        fn parse_one_capability(data: &[u8]) -> Option<HfiUpdate> {
+            let mut cpu: Option<u32> = None;
+            let mut perf: Option<u8> = None;
+            let mut eff: Option<u8> = None;
+
+            let mut off = 0;
+            while off + 4 <= data.len() {
+                let nla = unsafe { &*(data.as_ptr().add(off) as *const NlAttr) };
+                let len = nla.nla_len as usize;
+                if len < 4 || off + len > data.len() {
+                    break;
+                }
+                let payload = &data[off + 4..off + len];
+
+                match nla.nla_type & 0x7fff {
+                    THERMAL_GENL_ATTR_CPU_CAPABILITY_ID if payload.len() >= 4 => {
+                        cpu = Some(u32::from_ne_bytes([
+                            payload[0], payload[1], payload[2], payload[3],
+                        ]));
+                    }
+                    THERMAL_GENL_ATTR_CPU_CAPABILITY_PERFORMANCE if !payload.is_empty() => {
+                        // May be u32 encoded, take low byte
+                        perf = Some(if payload.len() >= 4 {
+                            let v = u32::from_ne_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]);
+                            v.min(255) as u8
+                        } else {
+                            payload[0]
+                        });
+                    }
+                    THERMAL_GENL_ATTR_CPU_CAPABILITY_EFFICIENCY if !payload.is_empty() => {
+                        eff = Some(if payload.len() >= 4 {
+                            let v = u32::from_ne_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]);
+                            v.min(255) as u8
+                        } else {
+                            payload[0]
+                        });
+                    }
+                    _ => {}
+                }
+                off += nla_align(len);
+            }
+
+            Some(HfiUpdate {
+                cpu: cpu?,
+                perf: perf.unwrap_or(0),
+                eff: eff.unwrap_or(0),
+            })
+        }
+    }
+}
 
 const SCHEDULER_NAME: &str = "scx_meteor";
 const TIER_LP_U8: u8 = 0;
@@ -437,8 +807,39 @@ fn save_procdb(skel: &BpfSkel<'_>) -> Result<()> {
         }
     }
 
+    // Delete consumed observation keys so they aren't re-merged next cycle
+    for key in &obs_keys {
+        let _ = skel.maps.procdb_observations.delete(key);
+    }
+
     if merged == 0 {
         return Ok(());
+    }
+
+    // Write merged profiles back to BPF proc_profiles map (close the learning loop)
+    for (comm, profile) in &profiles {
+        let key = comm_key(comm);
+        let mut bpf_profile: proc_profile = unsafe { std::mem::zeroed() };
+        bpf_profile.tier = profile.tier;
+        bpf_profile.confidence = profile.confidence;
+        bpf_profile.vol_ctx_per_sec = profile.vol_ctx_per_sec;
+        bpf_profile.wakeups_per_sec = profile.wakeups_per_sec;
+        bpf_profile.observations = profile.observations;
+        bpf_profile.avg_burst_ns = profile.avg_burst_ns;
+        bpf_profile.avg_sleep_ns = profile.avg_sleep_ns;
+        bpf_profile.total_runtime_ns = profile.total_runtime_ns;
+        bpf_profile.last_seen_ns = 0;
+
+        let val_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                &bpf_profile as *const _ as *const u8,
+                std::mem::size_of::<proc_profile>(),
+            )
+        };
+        let _ = skel
+            .maps
+            .proc_profiles
+            .update(&key, val_bytes, libbpf_rs::MapFlags::ANY);
     }
 
     if let Some(parent) = path.parent() {
@@ -450,7 +851,7 @@ fn save_procdb(skel: &BpfSkel<'_>) -> Result<()> {
     fs::write(&tmp_path, &json)?;
     fs::rename(&tmp_path, &path)?;
 
-    info!("procdb: persisted {} profiles → {:?}", profiles.len(), path);
+    info!("procdb: persisted {} profiles ({}  merged) → {:?}", profiles.len(), merged, path);
     Ok(())
 }
 
@@ -633,6 +1034,14 @@ struct Opts {
     #[clap(long, default_value = "1000")]
     bursty_hold_ms: u64,
 
+    /// Waker-wakee transitive tier boost duration (ms).
+    #[clap(long, default_value = "5")]
+    waker_boost_ms: u64,
+
+    /// Working set minor fault rate threshold (faults/sec) for LP exclusion.
+    #[clap(long, default_value = "1000")]
+    ws_fault_rate_thresh: u64,
+
     /// Minimum procdb confidence (observations) before trusting a profile.
     #[clap(short = 'c', long, default_value = "3")]
     procdb_confidence_min: u32,
@@ -700,6 +1109,7 @@ struct Scheduler<'a> {
     hfi_paths: Vec<Option<HfiPaths>>,
     hfi_update_interval: Duration,
     last_hfi_update: Instant,
+    thermal_nl: Option<thermal_netlink::ThermalNetlink>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -745,6 +1155,8 @@ impl<'a> Scheduler<'a> {
             rodata.bursty_window_ns = opts.bursty_window_ms * 1_000_000;
             rodata.bursty_threshold = opts.bursty_threshold;
             rodata.bursty_hold_ns = opts.bursty_hold_ms * 1_000_000;
+            rodata.waker_boost_ns = opts.waker_boost_ms * 1_000_000;
+            rodata.ws_fault_rate_thresh = opts.ws_fault_rate_thresh;
             rodata.debug = opts.debug;
             upload_topology!(rodata, &tiers, nr_cpus);
         }
@@ -792,22 +1204,46 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        // Initialize HFI caps map (if available)
-        let hfi_paths = if opts.hfi_poll_ms == 0 {
+        // Initialize HFI: try thermal netlink first, fall back to sysfs polling
+        let thermal_nl = if opts.hfi_poll_ms != 0 {
+            match thermal_netlink::ThermalNetlink::open() {
+                Some(nl) => {
+                    info!("hfi: using thermal netlink (push-based)");
+                    Some(nl)
+                }
+                None => {
+                    info!("hfi: thermal netlink unavailable, falling back to sysfs polling");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let hfi_paths = if opts.hfi_poll_ms == 0 || thermal_nl.is_some() {
+            // No sysfs polling needed if netlink is active or HFI disabled
             Vec::new()
         } else {
             let paths = discover_hfi_paths(nr_cpus);
             if paths.iter().any(|p| p.is_some()) {
                 if let Err(e) = update_hfi_caps_map(&skel, &paths) {
-                    warn!("hfi: initial update failed: {}", e);
+                    warn!("hfi: initial sysfs update failed: {}", e);
                 } else {
-                    info!("hfi: initial caps loaded");
+                    info!("hfi: initial caps loaded from sysfs");
                 }
                 paths
             } else {
                 Vec::new()
             }
         };
+
+        // If using netlink, do an initial sysfs read to seed the map
+        if thermal_nl.is_some() {
+            let paths = discover_hfi_paths(nr_cpus);
+            if paths.iter().any(|p| p.is_some()) {
+                let _ = update_hfi_caps_map(&skel, &paths);
+            }
+        }
 
         // Set up stats server
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
@@ -832,6 +1268,7 @@ impl<'a> Scheduler<'a> {
             hfi_paths,
             hfi_update_interval: Duration::from_millis(opts.hfi_poll_ms.max(100)),
             last_hfi_update: Instant::now(),
+            thermal_nl,
         })
     }
 
@@ -872,12 +1309,35 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
-            // Periodic HFI caps update
-            if !self.hfi_paths.is_empty()
+            // HFI update: prefer thermal netlink (push), fallback to sysfs (poll)
+            if let Some(ref nl) = self.thermal_nl {
+                let updates = nl.try_recv();
+                for u in &updates {
+                    let mut caps: hfi_caps = unsafe { std::mem::zeroed() };
+                    caps.perf = u.perf;
+                    caps.eff = u.eff;
+                    caps.valid = 1;
+                    let key = u.cpu.to_ne_bytes();
+                    let val_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            &caps as *const _ as *const u8,
+                            std::mem::size_of::<hfi_caps>(),
+                        )
+                    };
+                    let _ = self.skel.maps.hfi_caps_map.update(
+                        &key,
+                        val_bytes,
+                        libbpf_rs::MapFlags::ANY,
+                    );
+                }
+                if !updates.is_empty() {
+                    debug!("hfi: netlink update for {} CPUs", updates.len());
+                }
+            } else if !self.hfi_paths.is_empty()
                 && self.last_hfi_update.elapsed() >= self.hfi_update_interval
             {
                 if let Err(e) = update_hfi_caps_map(&self.skel, &self.hfi_paths) {
-                    warn!("hfi: update failed: {}", e);
+                    warn!("hfi: sysfs update failed: {}", e);
                 }
                 self.last_hfi_update = Instant::now();
             }

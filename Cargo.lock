@@ -3936,6 +3936,7 @@ dependencies = [
  "ctrlc",
  "dirs",
  "libbpf-rs",
+ "libc",
  "log",
  "scx_cargo",
  "scx_stats",
