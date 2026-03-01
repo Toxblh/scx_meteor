@@ -18,16 +18,19 @@ mod stats;
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use clap::Parser;
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, ValueEnum};
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::MapCore;
 use libbpf_rs::OpenObject;
@@ -67,8 +70,6 @@ mod thermal_netlink {
     const THERMAL_GENL_ATTR_CPU_CAPABILITY_EFFICIENCY: u16 = 18;
 
     const THERMAL_FAMILY_NAME: &[u8] = b"thermal\0";
-    const THERMAL_EVENT_GROUP: &[u8] = b"event\0";
-
     const NLA_ALIGNTO: usize = 4;
     fn nla_align(len: usize) -> usize {
         (len + NLA_ALIGNTO - 1) & !(NLA_ALIGNTO - 1)
@@ -456,6 +457,317 @@ struct ProcProfile {
 struct HfiPaths {
     perf: PathBuf,
     eff: PathBuf,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum IrqPolicy {
+    Off,
+    Conservative,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum IrqBackend {
+    IrqBalance,
+    Native,
+}
+
+#[derive(Debug, Clone)]
+struct SavedIrqAffinity {
+    irq: u32,
+    affinity_list: String,
+}
+
+#[derive(Debug)]
+struct IrqManager {
+    policy: IrqPolicy,
+    backend: IrqBackend,
+    irqbalance_socket: Option<PathBuf>,
+    lp_affinity_list: String,
+    banned_cpus_list: String,
+    lp_stable_for: Duration,
+    lp_since: Option<Instant>,
+    applied: bool,
+    disabled: bool,
+    saved_native: Vec<SavedIrqAffinity>,
+}
+
+impl IrqManager {
+    fn new(policy: IrqPolicy, lp_cpus: &[u32], nr_cpus: usize, lp_stable_for: Duration) -> Self {
+        let lp_affinity_list = compress_cpu_list(lp_cpus);
+
+        let mut is_lp = vec![false; nr_cpus];
+        for &cpu in lp_cpus {
+            if (cpu as usize) < nr_cpus {
+                is_lp[cpu as usize] = true;
+            }
+        }
+
+        let mut non_lp = Vec::new();
+        for cpu in 0..nr_cpus {
+            if !is_lp[cpu] {
+                non_lp.push(cpu as u32);
+            }
+        }
+        let banned_cpus_list = compress_cpu_list(&non_lp);
+        let irqbalance_socket = find_irqbalance_socket();
+        let backend = if irqbalance_socket.is_some() {
+            IrqBackend::IrqBalance
+        } else {
+            IrqBackend::Native
+        };
+
+        let mut mgr = Self {
+            policy,
+            backend,
+            irqbalance_socket,
+            lp_affinity_list,
+            banned_cpus_list,
+            lp_stable_for,
+            lp_since: None,
+            applied: false,
+            disabled: false,
+            saved_native: Vec::new(),
+        };
+
+        if mgr.policy == IrqPolicy::Conservative {
+            if mgr.lp_affinity_list.is_empty() {
+                warn!("irq: LP CPU list is empty, disabling IRQ policy");
+                mgr.disabled = true;
+            } else if mgr.banned_cpus_list.is_empty() {
+                info!("irq: all CPUs are LP-capable, IRQ policy has nothing to constrain");
+                mgr.disabled = true;
+            } else {
+                info!(
+                    "irq: policy=conservative backend={:?} lp='{}' banned='{}'",
+                    mgr.backend, mgr.lp_affinity_list, mgr.banned_cpus_list
+                );
+            }
+        }
+
+        mgr
+    }
+
+    fn tick(&mut self, lp_only_active: bool) -> Result<()> {
+        if self.policy == IrqPolicy::Off || self.disabled {
+            return Ok(());
+        }
+
+        if lp_only_active {
+            if self.lp_since.is_none() {
+                self.lp_since = Some(Instant::now());
+            }
+
+            if !self.applied && self.lp_since.unwrap().elapsed() >= self.lp_stable_for {
+                self.apply()?;
+            }
+        } else {
+            self.lp_since = None;
+            if self.applied {
+                self.restore()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.applied {
+            return Ok(());
+        }
+
+        match self.backend {
+            IrqBackend::IrqBalance => self.restore_irqbalance()?,
+            IrqBackend::Native => self.restore_native(),
+        }
+
+        self.applied = false;
+        self.lp_since = None;
+        info!("irq: restored default IRQ placement");
+        Ok(())
+    }
+
+    fn apply(&mut self) -> Result<()> {
+        if self.applied {
+            return Ok(());
+        }
+
+        match self.backend {
+            IrqBackend::IrqBalance => self.apply_irqbalance()?,
+            IrqBackend::Native => self.apply_native()?,
+        }
+
+        self.applied = true;
+        info!("irq: constrained IRQ handling to LP cores");
+        Ok(())
+    }
+
+    fn apply_irqbalance(&self) -> Result<()> {
+        let socket = self
+            .irqbalance_socket
+            .as_ref()
+            .context("irqbalance backend selected but no socket found")?;
+        let cmd = format!("settings cpus {}", self.banned_cpus_list);
+        send_irqbalance_cmd(socket, &cmd)
+    }
+
+    fn restore_irqbalance(&self) -> Result<()> {
+        let socket = self
+            .irqbalance_socket
+            .as_ref()
+            .context("irqbalance backend selected but no socket found")?;
+        send_irqbalance_cmd(socket, "settings cpus NULL")
+    }
+
+    fn apply_native(&mut self) -> Result<()> {
+        let irqs = collect_irq_numbers()?;
+        self.saved_native.clear();
+        let mut writes = 0usize;
+
+        for irq in irqs {
+            let path = format!("/proc/irq/{}/smp_affinity_list", irq);
+            let prev = match fs::read_to_string(&path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let prev = prev.trim().to_string();
+            if prev.is_empty() {
+                continue;
+            }
+
+            self.saved_native.push(SavedIrqAffinity {
+                irq,
+                affinity_list: prev,
+            });
+
+            let val = format!("{}\n", self.lp_affinity_list);
+            match fs::write(&path, val) {
+                Ok(_) => writes += 1,
+                Err(e) => warn!("irq: failed to update {}: {}", path, e),
+            }
+        }
+
+        if writes == 0 && !self.saved_native.is_empty() {
+            return Err(anyhow!("irq: native backend failed to update any IRQ affinities"));
+        }
+
+        Ok(())
+    }
+
+    fn restore_native(&mut self) {
+        for saved in &self.saved_native {
+            let path = format!("/proc/irq/{}/smp_affinity_list", saved.irq);
+            let val = format!("{}\n", saved.affinity_list);
+            if let Err(e) = fs::write(&path, val) {
+                warn!("irq: failed to restore {}: {}", path, e);
+            }
+        }
+        self.saved_native.clear();
+    }
+}
+
+fn compress_cpu_list(cpus: &[u32]) -> String {
+    if cpus.is_empty() {
+        return String::new();
+    }
+
+    let mut sorted = cpus.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let mut parts = Vec::new();
+    let mut start = sorted[0];
+    let mut prev = sorted[0];
+
+    for &cpu in sorted.iter().skip(1) {
+        if cpu == prev + 1 {
+            prev = cpu;
+            continue;
+        }
+        if start == prev {
+            parts.push(start.to_string());
+        } else {
+            parts.push(format!("{}-{}", start, prev));
+        }
+        start = cpu;
+        prev = cpu;
+    }
+
+    if start == prev {
+        parts.push(start.to_string());
+    } else {
+        parts.push(format!("{}-{}", start, prev));
+    }
+
+    parts.join(",")
+}
+
+fn parse_irq_number(line: &str) -> Option<u32> {
+    let line = line.trim_start();
+    let mut end = 0usize;
+    for b in line.as_bytes() {
+        if b.is_ascii_digit() {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if end == 0 || line.as_bytes().get(end) != Some(&b':') {
+        return None;
+    }
+    line[..end].parse::<u32>().ok()
+}
+
+fn collect_irq_numbers() -> Result<Vec<u32>> {
+    let file = fs::File::open("/proc/interrupts").context("open /proc/interrupts")?;
+    let reader = BufReader::new(file);
+    let mut irqs = Vec::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(irq) = parse_irq_number(&line) {
+            irqs.push(irq);
+        }
+    }
+
+    Ok(irqs)
+}
+
+fn find_irqbalance_socket() -> Option<PathBuf> {
+    let entries = fs::read_dir("/run/irqbalance").ok()?;
+    let mut candidates: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name_ok = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("irqbalance") && n.ends_with(".sock"))
+                .unwrap_or(false);
+            if !name_ok {
+                return false;
+            }
+            p.metadata()
+                .map(|m| m.file_type().is_socket())
+                .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+fn send_irqbalance_cmd(socket_path: &Path, cmd: &str) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("connect to irqbalance socket {:?}", socket_path))?;
+    stream
+        .write_all(cmd.as_bytes())
+        .with_context(|| format!("send irqbalance command '{}'", cmd))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let mut buf = [0u8; 128];
+    let _ = stream.read(&mut buf);
+    Ok(())
 }
 
 /// Read cpuinfo_max_freq (kHz) for a CPU from sysfs.
@@ -1054,6 +1366,14 @@ struct Opts {
     #[clap(long, default_value = "1000")]
     hfi_poll_ms: u64,
 
+    /// IRQ steering policy. Conservative mode keeps IRQs on LP CPUs in stable LP-only periods.
+    #[clap(long, value_enum, default_value_t = IrqPolicy::Off)]
+    irq_policy: IrqPolicy,
+
+    /// LP-only stability delay before applying IRQ steering.
+    #[clap(long, default_value = "1500")]
+    irq_lp_stable_ms: u64,
+
     /// Cgroup paths to force into LP tier (background.slice).
     #[clap(long, value_delimiter = ',')]
     background_cgroup: Vec<PathBuf>,
@@ -1101,8 +1421,6 @@ struct Opts {
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
-    opts: &'a Opts,
-    tiers: CoreTiers,
     stats_server: StatsServer<(), Metrics>,
     procdb_save_interval: Option<Duration>,
     last_procdb_save: std::time::Instant,
@@ -1110,6 +1428,7 @@ struct Scheduler<'a> {
     hfi_update_interval: Duration,
     last_hfi_update: Instant,
     thermal_nl: Option<thermal_netlink::ThermalNetlink>,
+    irq_manager: IrqManager,
 }
 
 impl<'a> Scheduler<'a> {
@@ -1248,6 +1567,13 @@ impl<'a> Scheduler<'a> {
         // Set up stats server
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
+        let irq_manager = IrqManager::new(
+            opts.irq_policy,
+            &tiers.lp_cpus,
+            nr_cpus,
+            Duration::from_millis(opts.irq_lp_stable_ms.max(100)),
+        );
+
         // Attach the scheduler
         let struct_ops = Some(scx_ops_attach!(skel, meteor_ops)?);
 
@@ -1256,8 +1582,6 @@ impl<'a> Scheduler<'a> {
         Ok(Scheduler {
             skel,
             struct_ops,
-            opts,
-            tiers,
             stats_server,
             procdb_save_interval: if opts.procdb_save_interval_s == 0 {
                 None
@@ -1269,6 +1593,7 @@ impl<'a> Scheduler<'a> {
             hfi_update_interval: Duration::from_millis(opts.hfi_poll_ms.max(100)),
             last_hfi_update: Instant::now(),
             thermal_nl,
+            irq_manager,
         })
     }
 
@@ -1293,6 +1618,24 @@ impl<'a> Scheduler<'a> {
 
     pub fn exited(&mut self) -> bool {
         uei_exited!(&self.skel, uei)
+    }
+
+    fn read_lp_only_active(&self) -> Result<bool> {
+        let key = 0u32.to_ne_bytes();
+        let val = self
+            .skel
+            .maps
+            .lp_only_state_map
+            .lookup(&key, libbpf_rs::MapFlags::ANY)?;
+        let Some(bytes) = val else {
+            return Ok(false);
+        };
+        if bytes.len() < std::mem::size_of::<u64>() {
+            return Ok(false);
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes[..8]);
+        Ok(u64::from_ne_bytes(arr) != 0)
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
@@ -1342,6 +1685,16 @@ impl<'a> Scheduler<'a> {
                 self.last_hfi_update = Instant::now();
             }
 
+            match self.read_lp_only_active() {
+                Ok(lp_only) => {
+                    if let Err(e) = self.irq_manager.tick(lp_only) {
+                        warn!("irq: policy update failed, disabling IRQ steering: {}", e);
+                        self.irq_manager.disabled = true;
+                    }
+                }
+                Err(e) => warn!("irq: failed to read LP-only state: {}", e),
+            }
+
             match req_ch.recv_timeout(Duration::from_secs(1)) {
                 Ok(()) => res_ch.send(self.get_metrics())?,
                 Err(RecvTimeoutError::Timeout) => {}
@@ -1352,6 +1705,9 @@ impl<'a> Scheduler<'a> {
         // Final procdb save
         if let Err(e) = save_procdb(&self.skel) {
             warn!("procdb: final save failed: {}", e);
+        }
+        if let Err(e) = self.irq_manager.restore() {
+            warn!("irq: final restore failed: {}", e);
         }
 
         let _ = self.struct_ops.take();
