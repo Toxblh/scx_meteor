@@ -38,6 +38,11 @@ sudo cat /sys/kernel/tracing/trace_pipe
 - **LP-only mode** at low system load (keeps Compute tile off).
 - **Strict LP mode** to prevent LP-tier tasks from running on E/P cores.
 - **Interactive detection** (wakeup freq, ctx-switch rate, sync-wake).
+- **Explicit cost-model** in BPF: `wait_on_lp` vs `wake_compute` with migration penalty.
+- **Latency guard** driven by interactive wake latency SLA.
+- **Burst credits**: limited short boosts followed by mandatory drain-back.
+- **Global objective loop**: reduce compute wakeups/sec while preserving latency SLA.
+- **Dynamic EPP/EPB policy** coupled to objective state.
 - **CPU-bound demotion** (degradable priorities).
 - **Bursty pattern tracking** to avoid ping-pong.
 - **Procdb** with on-disk persistence for warm starts.
@@ -114,6 +119,27 @@ sudo cat /sys/kernel/tracing/trace_pipe
 ### HFI
 - `--hfi-poll-ms <MILLISECONDS>`
 
+### Cost-model / latency guard / burst credits
+- `--cost-wait-us-per-queued <MICROSECONDS>`
+- `--cost-wake-compute-us <MICROSECONDS>`
+- `--cost-migrate-us <MICROSECONDS>`
+- `--latency-guard-ms <MILLISECONDS>`
+- `--latency-guard-boost-ms <MILLISECONDS>`
+- `--burst-credit-max <N>`
+- `--burst-credit-resume <N>`
+- `--burst-credit-refill-ms <MILLISECONDS>`
+- `--burst-credit-cost-e <N>`
+- `--burst-credit-cost-p <N>`
+
+### Objective and dynamic energy policy
+- `--objective-enabled <true|false>`
+- `--objective-tick-ms <MILLISECONDS>`
+- `--objective-compute-wakeups-target <N_PER_SEC>`
+- `--objective-latency-sla-ms <MILLISECONDS>`
+- `--objective-latency-hold-ms <MILLISECONDS>`
+- `--epp-epb-dynamic <true|false>`
+- `--epp-epb-update-ms <MILLISECONDS>`
+
 ### Overrides
 - `--background-cgroup <PATHS>`
 - `--background-cgroup-id <IDS>`
@@ -161,6 +187,11 @@ sudo cat /sys/kernel/tracing/trace_pipe
 - **LP‑only** при низкой нагрузке.
 - **Strict LP** (LP‑задачи не уходят на E/P).
 - **Интерактивность** по wakeup/ctx‑switch/sync‑wake.
+- **Явная cost-model** в BPF: `wait_on_lp` vs `wake_compute` с ценой миграции.
+- **Latency guard** на базе SLA по wake latency.
+- **Burst credits**: ограниченные бусты и обязательный drain-back.
+- **Глобальная objective-петля**: минимизирует `compute_wakeups/sec` при соблюдении latency SLA.
+- **Динамический EPP/EPB** как часть единой политики.
 - **Деградация CPU‑bound**.
 - **Анти‑ping‑pong** через bursty‑tracking.
 - **Procdb** с сохранением профилей.

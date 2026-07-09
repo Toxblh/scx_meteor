@@ -109,6 +109,26 @@ struct meteor_stats {
 	u64 nr_lp_only_forced;
 	u64 nr_interactive_promos;
 	u64 nr_cpu_bound_demotes;
+	u64 nr_compute_wakeups;     /* explicit wake-ups of Compute tile */
+	u64 nr_latency_guard_trips; /* latency guard activations */
+	u64 nr_cost_wait_lp;        /* chose wait_on_lp in cost-model */
+	u64 nr_cost_wake_compute;   /* chose wake_compute in cost-model */
+	u64 nr_cost_migrate;        /* migrate cost component used */
+	u64 sum_wake_latency_ns;    /* aggregate runnable->dispatch latency */
+	u64 nr_wake_latency_samples;
+};
+
+/* ------------------------------------------------------------------ */
+/* Global objective controller state (userspace -> BPF)               */
+/* ------------------------------------------------------------------ */
+struct objective_ctrl {
+	u8  allow_compute_wake; /* 1: allow LP->E wake when cost says so */
+	u8  latency_pressure;   /* 1: latency SLA pressure present */
+	u8  _pad0;
+	u8  _pad1;
+	u32 target_compute_wakeups_per_s;
+	u32 epoch;
+	u64 latency_sla_ns;
 };
 
 /* ------------------------------------------------------------------ */

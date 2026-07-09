@@ -770,6 +770,260 @@ fn send_irqbalance_cmd(socket_path: &Path, cmd: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum EnergyMode {
+    Economy,
+    Balanced,
+    Responsive,
+}
+
+#[derive(Debug)]
+struct ObjectiveController {
+    enabled: bool,
+    target_compute_wakeups_per_s: u32,
+    latency_sla_ns: u64,
+    latency_hold: Duration,
+    allow_compute_wake: bool,
+    latency_pressure_until: Option<Instant>,
+    epoch: u32,
+}
+
+impl ObjectiveController {
+    fn new(opts: &Opts) -> Self {
+        Self {
+            enabled: opts.objective_enabled,
+            target_compute_wakeups_per_s: opts.objective_compute_wakeups_target,
+            latency_sla_ns: opts.objective_latency_sla_ms * 1_000_000,
+            latency_hold: Duration::from_millis(opts.objective_latency_hold_ms.max(100)),
+            allow_compute_wake: true,
+            latency_pressure_until: None,
+            epoch: 1,
+        }
+    }
+
+    fn write_ctrl(&self, skel: &BpfSkel<'_>, latency_pressure: bool) -> Result<()> {
+        let mut ctrl: objective_ctrl = unsafe { std::mem::zeroed() };
+        ctrl.allow_compute_wake = if self.allow_compute_wake { 1 } else { 0 };
+        ctrl.latency_pressure = if latency_pressure { 1 } else { 0 };
+        ctrl.target_compute_wakeups_per_s = self.target_compute_wakeups_per_s;
+        ctrl.epoch = self.epoch;
+        ctrl.latency_sla_ns = self.latency_sla_ns;
+
+        let key = 0u32.to_ne_bytes();
+        let val = unsafe {
+            std::slice::from_raw_parts(
+                &ctrl as *const _ as *const u8,
+                std::mem::size_of::<objective_ctrl>(),
+            )
+        };
+        skel.maps
+            .objective_ctrl_map
+            .update(&key, val, libbpf_rs::MapFlags::ANY)?;
+        Ok(())
+    }
+
+    fn init(&mut self, skel: &BpfSkel<'_>) -> Result<()> {
+        self.allow_compute_wake = true;
+        self.epoch = 1;
+        self.write_ctrl(skel, false)
+    }
+
+    fn tick(&mut self, skel: &BpfSkel<'_>, delta: &Metrics) -> Result<EnergyMode> {
+        if !self.enabled {
+            return Ok(EnergyMode::Balanced);
+        }
+
+        let now = Instant::now();
+        let avg_latency_ns = if delta.nr_wake_latency_samples > 0 {
+            delta.sum_wake_latency_ns / delta.nr_wake_latency_samples
+        } else {
+            0
+        };
+        let latency_violation = delta.nr_latency_guard_trips > 0
+            || (delta.nr_wake_latency_samples > 0 && avg_latency_ns > self.latency_sla_ns);
+        if latency_violation {
+            self.latency_pressure_until = Some(now + self.latency_hold);
+        }
+        let latency_pressure = self
+            .latency_pressure_until
+            .map(|until| until > now)
+            .unwrap_or(false);
+
+        if latency_pressure {
+            self.allow_compute_wake = true;
+        } else {
+            let target = self.target_compute_wakeups_per_s as u64;
+            if delta.nr_compute_wakeups > target {
+                self.allow_compute_wake = false;
+            } else if delta.nr_compute_wakeups + 1 < target {
+                self.allow_compute_wake = true;
+            }
+        }
+
+        self.epoch = self.epoch.wrapping_add(1);
+        self.write_ctrl(skel, latency_pressure)?;
+
+        let mode = if latency_pressure {
+            EnergyMode::Responsive
+        } else if !self.allow_compute_wake {
+            EnergyMode::Economy
+        } else {
+            EnergyMode::Balanced
+        };
+
+        debug!(
+            "objective: wakeups/s={} target={} avg_lat_ms={:.2} pressure={} allow_compute={} epoch={}",
+            delta.nr_compute_wakeups,
+            self.target_compute_wakeups_per_s,
+            avg_latency_ns as f64 / 1_000_000.0,
+            latency_pressure,
+            self.allow_compute_wake,
+            self.epoch
+        );
+
+        Ok(mode)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SavedKnob {
+    path: PathBuf,
+    value: String,
+}
+
+#[derive(Debug)]
+struct EnergyPolicyManager {
+    enabled: bool,
+    disabled: bool,
+    epp_paths: Vec<PathBuf>,
+    epb_paths: Vec<PathBuf>,
+    saved_epp: Vec<SavedKnob>,
+    saved_epb: Vec<SavedKnob>,
+    current_mode: Option<EnergyMode>,
+    update_interval: Duration,
+    last_update: Instant,
+}
+
+impl EnergyPolicyManager {
+    fn new(opts: &Opts, nr_cpus: usize) -> Self {
+        let epp_paths = (0..nr_cpus)
+            .map(|cpu| {
+                PathBuf::from(format!(
+                    "/sys/devices/system/cpu/cpu{}/cpufreq/energy_performance_preference",
+                    cpu
+                ))
+            })
+            .filter(|p| p.exists())
+            .collect::<Vec<_>>();
+
+        let epb_paths = (0..nr_cpus)
+            .map(|cpu| {
+                PathBuf::from(format!(
+                    "/sys/devices/system/cpu/cpu{}/power/energy_perf_bias",
+                    cpu
+                ))
+            })
+            .filter(|p| p.exists())
+            .collect::<Vec<_>>();
+
+        let saved_epp = epp_paths
+            .iter()
+            .filter_map(|p| {
+                fs::read_to_string(p).ok().map(|v| SavedKnob {
+                    path: p.clone(),
+                    value: v.trim().to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let saved_epb = epb_paths
+            .iter()
+            .filter_map(|p| {
+                fs::read_to_string(p).ok().map(|v| SavedKnob {
+                    path: p.clone(),
+                    value: v.trim().to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut mgr = Self {
+            enabled: opts.epp_epb_dynamic,
+            disabled: false,
+            epp_paths,
+            epb_paths,
+            saved_epp,
+            saved_epb,
+            current_mode: None,
+            update_interval: Duration::from_millis(opts.epp_epb_update_ms.max(200)),
+            last_update: Instant::now(),
+        };
+
+        if mgr.enabled && mgr.epp_paths.is_empty() && mgr.epb_paths.is_empty() {
+            info!("energy: no EPP/EPB knobs found, disabling energy policy manager");
+            mgr.enabled = false;
+        }
+
+        mgr
+    }
+
+    fn mode_values(mode: EnergyMode) -> (&'static str, &'static str) {
+        match mode {
+            EnergyMode::Economy => ("power", "12"),
+            EnergyMode::Balanced => ("balance_power", "8"),
+            EnergyMode::Responsive => ("balance_performance", "4"),
+        }
+    }
+
+    fn apply_mode(&mut self, mode: EnergyMode, force: bool) -> Result<()> {
+        if !self.enabled || self.disabled {
+            return Ok(());
+        }
+        if !force && self.last_update.elapsed() < self.update_interval {
+            return Ok(());
+        }
+        if !force && self.current_mode == Some(mode) {
+            self.last_update = Instant::now();
+            return Ok(());
+        }
+
+        let (epp, epb) = Self::mode_values(mode);
+        let mut writes = 0usize;
+
+        for path in &self.epp_paths {
+            if fs::write(path, format!("{}\n", epp)).is_ok() {
+                writes += 1;
+            }
+        }
+        for path in &self.epb_paths {
+            if fs::write(path, format!("{}\n", epb)).is_ok() {
+                writes += 1;
+            }
+        }
+
+        if writes == 0 && (!self.epp_paths.is_empty() || !self.epb_paths.is_empty()) {
+            return Err(anyhow!("energy: failed to write EPP/EPB knobs (permission?)"));
+        }
+
+        self.current_mode = Some(mode);
+        self.last_update = Instant::now();
+        debug!("energy: mode set to {:?}", mode);
+        Ok(())
+    }
+
+    fn restore(&mut self) {
+        if !self.enabled || self.disabled {
+            return;
+        }
+
+        for saved in &self.saved_epp {
+            let _ = fs::write(&saved.path, format!("{}\n", saved.value));
+        }
+        for saved in &self.saved_epb {
+            let _ = fs::write(&saved.path, format!("{}\n", saved.value));
+        }
+        self.current_mode = None;
+    }
+}
+
 /// Read cpuinfo_max_freq (kHz) for a CPU from sysfs.
 fn read_max_freq_khz(cpu: usize) -> Option<usize> {
     let path = format!(
@@ -1354,6 +1608,74 @@ struct Opts {
     #[clap(long, default_value = "1000")]
     ws_fault_rate_thresh: u64,
 
+    /// Cost-model: LP queue wait cost per queued task (microseconds).
+    #[clap(long, default_value = "800")]
+    cost_wait_us_per_queued: u64,
+
+    /// Cost-model: fixed cost to wake Compute tile (microseconds).
+    #[clap(long, default_value = "3500")]
+    cost_wake_compute_us: u64,
+
+    /// Cost-model: cross-cluster migration penalty (microseconds).
+    #[clap(long, default_value = "700")]
+    cost_migrate_us: u64,
+
+    /// Latency guard SLA for interactive runnable->dispatch latency (ms).
+    #[clap(long, default_value = "12")]
+    latency_guard_ms: u64,
+
+    /// Latency guard hold time after violation (ms).
+    #[clap(long, default_value = "120")]
+    latency_guard_boost_ms: u64,
+
+    /// Burst credit bucket size.
+    #[clap(long, default_value = "6")]
+    burst_credit_max: u32,
+
+    /// Burst credits needed to leave mandatory drain mode.
+    #[clap(long, default_value = "2")]
+    burst_credit_resume: u32,
+
+    /// Burst credit refill cadence in milliseconds.
+    #[clap(long, default_value = "150")]
+    burst_credit_refill_ms: u64,
+
+    /// Burst credit cost for LP->E escalation.
+    #[clap(long, default_value = "1")]
+    burst_credit_cost_e: u32,
+
+    /// Burst credit cost for *->P escalation.
+    #[clap(long, default_value = "2")]
+    burst_credit_cost_p: u32,
+
+    /// Enable userspace global objective controller.
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    objective_enabled: bool,
+
+    /// Objective loop tick interval (ms).
+    #[clap(long, default_value = "1000")]
+    objective_tick_ms: u64,
+
+    /// Objective: target compute wakeups per second.
+    #[clap(long, default_value = "4")]
+    objective_compute_wakeups_target: u32,
+
+    /// Objective: latency SLA in ms (average runnable->dispatch).
+    #[clap(long, default_value = "12")]
+    objective_latency_sla_ms: u64,
+
+    /// Objective: keep latency pressure state for this long (ms).
+    #[clap(long, default_value = "2000")]
+    objective_latency_hold_ms: u64,
+
+    /// Enable dynamic EPP/EPB policy driven by objective state.
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    epp_epb_dynamic: bool,
+
+    /// EPP/EPB reapply interval in ms.
+    #[clap(long, default_value = "1000")]
+    epp_epb_update_ms: u64,
+
     /// Minimum procdb confidence (observations) before trusting a profile.
     #[clap(short = 'c', long, default_value = "3")]
     procdb_confidence_min: u32,
@@ -1429,6 +1751,11 @@ struct Scheduler<'a> {
     last_hfi_update: Instant,
     thermal_nl: Option<thermal_netlink::ThermalNetlink>,
     irq_manager: IrqManager,
+    objective: ObjectiveController,
+    energy_policy: EnergyPolicyManager,
+    objective_tick_interval: Duration,
+    last_objective_tick: Instant,
+    last_objective_metrics: Metrics,
 }
 
 impl<'a> Scheduler<'a> {
@@ -1476,6 +1803,16 @@ impl<'a> Scheduler<'a> {
             rodata.bursty_hold_ns = opts.bursty_hold_ms * 1_000_000;
             rodata.waker_boost_ns = opts.waker_boost_ms * 1_000_000;
             rodata.ws_fault_rate_thresh = opts.ws_fault_rate_thresh;
+            rodata.cost_wait_ns_per_task = opts.cost_wait_us_per_queued * 1_000;
+            rodata.cost_wake_compute = opts.cost_wake_compute_us * 1_000;
+            rodata.cost_migrate = opts.cost_migrate_us * 1_000;
+            rodata.latency_guard_ns = opts.latency_guard_ms * 1_000_000;
+            rodata.latency_guard_boost_ns = opts.latency_guard_boost_ms * 1_000_000;
+            rodata.burst_credit_max = opts.burst_credit_max.max(1);
+            rodata.burst_credit_resume = opts.burst_credit_resume.min(opts.burst_credit_max.max(1));
+            rodata.burst_credit_refill_ns = opts.burst_credit_refill_ms.max(10) * 1_000_000;
+            rodata.burst_credit_cost_e = opts.burst_credit_cost_e.max(1);
+            rodata.burst_credit_cost_p = opts.burst_credit_cost_p.max(opts.burst_credit_cost_e.max(1));
             rodata.debug = opts.debug;
             upload_topology!(rodata, &tiers, nr_cpus);
         }
@@ -1573,6 +1910,15 @@ impl<'a> Scheduler<'a> {
             nr_cpus,
             Duration::from_millis(opts.irq_lp_stable_ms.max(100)),
         );
+        let mut objective = ObjectiveController::new(opts);
+        if let Err(e) = objective.init(&skel) {
+            warn!("objective: init failed, continuing with BPF defaults: {}", e);
+        }
+        let mut energy_policy = EnergyPolicyManager::new(opts, nr_cpus);
+        if let Err(e) = energy_policy.apply_mode(EnergyMode::Balanced, true) {
+            warn!("energy: initial apply failed, disabling dynamic EPP/EPB: {}", e);
+            energy_policy.disabled = true;
+        }
 
         // Attach the scheduler
         let struct_ops = Some(scx_ops_attach!(skel, meteor_ops)?);
@@ -1594,6 +1940,11 @@ impl<'a> Scheduler<'a> {
             last_hfi_update: Instant::now(),
             thermal_nl,
             irq_manager,
+            objective,
+            energy_policy,
+            objective_tick_interval: Duration::from_millis(opts.objective_tick_ms.max(100)),
+            last_objective_tick: Instant::now(),
+            last_objective_metrics: Metrics::default(),
         })
     }
 
@@ -1613,6 +1964,13 @@ impl<'a> Scheduler<'a> {
             nr_lp_only_forced: bss.nr_lp_only_forced,
             nr_interactive_promos: bss.nr_interactive_promos,
             nr_cpu_bound_demotes: bss.nr_cpu_bound_demotes,
+            nr_compute_wakeups: bss.nr_compute_wakeups,
+            nr_latency_guard_trips: bss.nr_latency_guard_trips,
+            nr_cost_wait_lp: bss.nr_cost_wait_lp,
+            nr_cost_wake_compute: bss.nr_cost_wake_compute,
+            nr_cost_migrate: bss.nr_cost_migrate,
+            sum_wake_latency_ns: bss.sum_wake_latency_ns,
+            nr_wake_latency_samples: bss.nr_wake_latency_samples,
         }
     }
 
@@ -1640,6 +1998,8 @@ impl<'a> Scheduler<'a> {
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
+        self.last_objective_metrics = self.get_metrics();
+        self.last_objective_tick = Instant::now();
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             // Periodic procdb save
@@ -1695,6 +2055,22 @@ impl<'a> Scheduler<'a> {
                 Err(e) => warn!("irq: failed to read LP-only state: {}", e),
             }
 
+            if self.last_objective_tick.elapsed() >= self.objective_tick_interval {
+                let cur = self.get_metrics();
+                let delta = cur.delta(&self.last_objective_metrics);
+                match self.objective.tick(&self.skel, &delta) {
+                    Ok(mode) => {
+                        if let Err(e) = self.energy_policy.apply_mode(mode, false) {
+                            warn!("energy: dynamic apply failed, disabling EPP/EPB manager: {}", e);
+                            self.energy_policy.disabled = true;
+                        }
+                    }
+                    Err(e) => warn!("objective: control loop update failed: {}", e),
+                }
+                self.last_objective_metrics = cur;
+                self.last_objective_tick = Instant::now();
+            }
+
             match req_ch.recv_timeout(Duration::from_secs(1)) {
                 Ok(()) => res_ch.send(self.get_metrics())?,
                 Err(RecvTimeoutError::Timeout) => {}
@@ -1709,6 +2085,7 @@ impl<'a> Scheduler<'a> {
         if let Err(e) = self.irq_manager.restore() {
             warn!("irq: final restore failed: {}", e);
         }
+        self.energy_policy.restore();
 
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)

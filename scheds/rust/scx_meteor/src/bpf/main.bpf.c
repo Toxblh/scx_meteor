@@ -122,6 +122,22 @@ const volatile u64 waker_boost_ns       = 5000000ULL;  /* 5 ms */
 /* Working set: minor fault rate above this → task is WS-heavy, not LP */
 const volatile u64 ws_fault_rate_thresh = 1000;         /* faults/sec */
 
+/* Cost-model knobs (explicit tradeoff engine) */
+const volatile u64 cost_wait_ns_per_task = 800000ULL;   /* 0.8ms per queued LP task */
+const volatile u64 cost_wake_compute = 3500000ULL;      /* 3.5ms equivalent wake cost */
+const volatile u64 cost_migrate = 700000ULL;            /* 0.7ms migration penalty */
+
+/* Latency guard: if interactive wake->run exceeds SLA, bypass energy bias */
+const volatile u64 latency_guard_ns = 12000000ULL;      /* 12ms */
+const volatile u64 latency_guard_boost_ns = 120000000ULL; /* 120ms */
+
+/* Burst credit bucket: short boosts allowed, then mandatory drain-back */
+const volatile u32 burst_credit_max = 6;
+const volatile u32 burst_credit_resume = 2;
+const volatile u64 burst_credit_refill_ns = 150000000ULL; /* 150ms */
+const volatile u32 burst_credit_cost_e = 1;
+const volatile u32 burst_credit_cost_p = 2;
+
 /* ------------------------------------------------------------------ */
 /* CPU topology (set by userspace on init)                            */
 /* ------------------------------------------------------------------ */
@@ -153,6 +169,9 @@ volatile u64 nr_lp_shared, nr_e_shared, nr_p_shared;
 volatile u64 nr_escalations, nr_drainbacks, nr_procdb_hits;
 volatile u64 nr_interactive_promos, nr_cpu_bound_demotes;
 volatile u64 nr_lp_only_forced;
+volatile u64 nr_compute_wakeups, nr_latency_guard_trips;
+volatile u64 nr_cost_wait_lp, nr_cost_wake_compute, nr_cost_migrate;
+volatile u64 sum_wake_latency_ns, nr_wake_latency_samples;
 
 /* ------------------------------------------------------------------ */
 /* Debug helper                                                        */
@@ -196,6 +215,10 @@ struct task_ctx {
 	u32 burst_streak_e; /* consecutive bursts over E threshold   */
 	u32 bursty_count;   /* bursts within current window          */
 	u64 bursty_window_start; /* window start timestamp           */
+	u64 latency_guard_until; /* keep latency guard active until */
+	u64 burst_credit_last_refill_at;
+	u32 burst_credits;
+	u8  mandatory_drain;
 	u8  procdb_loaded;  /* initial tier came from procdb         */
 	u8  waker_tier;     /* tier of the last sync waker           */
 	u64 waker_boost_until; /* transitive boost expires at this ns */
@@ -270,6 +293,16 @@ struct {
 	__type(key, u32);
 	__type(value, u64);
 } lp_only_state_map SEC(".maps");
+
+/* ------------------------------------------------------------------ */
+/* Global objective control (updated by userspace control loop)       */
+/* ------------------------------------------------------------------ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct objective_ctrl);
+} objective_ctrl_map SEC(".maps");
 
 /* ------------------------------------------------------------------ */
 /* Helper: EWMA (75% old + 25% new)                                   */
@@ -388,6 +421,128 @@ static inline bool lp_only_active(void)
 	if (!statep)
 		return false;
 	return *statep != 0;
+}
+
+static inline struct objective_ctrl *objective_ctrl_ptr(void)
+{
+	u32 key = 0;
+
+	return bpf_map_lookup_elem(&objective_ctrl_map, &key);
+}
+
+static inline bool task_interactive_signal(struct task_ctx *tctx, u64 burst_ns)
+{
+	if (tctx->wakeup_freq >= interactive_wakeup_freq ||
+	    tctx->vol_ctx_per_sec >= interactive_csw_rate)
+		return true;
+	if (tctx->sync_wake)
+		return true;
+	if (burst_ns > 0 && burst_ns <= interactive_short_burst_ns &&
+	    tctx->wakeup_freq >= (interactive_wakeup_freq / 2))
+		return true;
+	return false;
+}
+
+static inline void refill_burst_credits(struct task_ctx *tctx, u64 now)
+{
+	u64 elapsed, tokens;
+	u64 capped;
+
+	if (tctx->burst_credit_last_refill_at == 0) {
+		tctx->burst_credit_last_refill_at = now;
+		return;
+	}
+	if (burst_credit_refill_ns == 0)
+		return;
+
+	elapsed = now - tctx->burst_credit_last_refill_at;
+	if (elapsed < burst_credit_refill_ns)
+		return;
+
+	tokens = elapsed / burst_credit_refill_ns;
+	capped = (u64)tctx->burst_credits + tokens;
+	if (capped > burst_credit_max)
+		capped = burst_credit_max;
+	tctx->burst_credits = (u32)capped;
+	tctx->burst_credit_last_refill_at += tokens * burst_credit_refill_ns;
+
+	if (tctx->mandatory_drain &&
+	    tctx->tier == TIER_LP &&
+	    tctx->burst_credits >= burst_credit_resume)
+		tctx->mandatory_drain = 0;
+}
+
+static inline bool latency_guard_active(struct task_ctx *tctx, u64 now, u64 burst_ns)
+{
+	struct objective_ctrl *ctrl = objective_ctrl_ptr();
+	u64 sla_ns = latency_guard_ns;
+	u64 wake_latency_ns = 0;
+	bool interactive = task_interactive_signal(tctx, burst_ns);
+	bool active = tctx->latency_guard_until > now;
+
+	if (ctrl && ctrl->latency_sla_ns > 0)
+		sla_ns = ctrl->latency_sla_ns;
+
+	if (tctx->last_woke_at > 0 && now > tctx->last_woke_at) {
+		wake_latency_ns = now - tctx->last_woke_at;
+		__sync_fetch_and_add(&sum_wake_latency_ns, wake_latency_ns);
+		__sync_fetch_and_add(&nr_wake_latency_samples, 1);
+	}
+
+	if (interactive && wake_latency_ns >= sla_ns) {
+		if (!active)
+			__sync_fetch_and_add(&nr_latency_guard_trips, 1);
+		tctx->latency_guard_until = now + latency_guard_boost_ns;
+		active = true;
+	}
+	if (ctrl && ctrl->latency_pressure && interactive)
+		active = true;
+
+	return active;
+}
+
+static inline u8 get_cpu_core_type(s32 cpu);
+
+static inline bool should_wake_compute(struct task_ctx *tctx, s32 prev_cpu,
+				       bool latency_guard, bool lp_only)
+{
+	struct objective_ctrl *ctrl = objective_ctrl_ptr();
+	u64 wait_cost, wake_cost;
+	u64 q_lp = (u64)scx_bpf_dsq_nr_queued(DSQ_LP);
+	bool allow_compute = true;
+
+	if (ctrl && !ctrl->allow_compute_wake)
+		allow_compute = false;
+	if (latency_guard)
+		allow_compute = true;
+	if (!allow_compute) {
+		__sync_fetch_and_add(&nr_cost_wait_lp, 1);
+		return false;
+	}
+
+	wait_cost = (q_lp + 1ULL) * cost_wait_ns_per_task;
+	wake_cost = cost_wake_compute;
+	if (tctx->wakeup_freq >= interactive_wakeup_freq * 2)
+		wait_cost += cost_wait_ns_per_task;
+
+	if (prev_cpu >= 0 && prev_cpu < MAX_CPUS &&
+	    get_cpu_core_type(prev_cpu) == CORE_LP) {
+		wake_cost += cost_migrate;
+		__sync_fetch_and_add(&nr_cost_migrate, 1);
+	}
+
+	if (lp_only && !latency_guard)
+		wake_cost += cost_wake_compute;
+	if (latency_guard && wake_cost > (cost_wake_compute / 2))
+		wake_cost -= cost_wake_compute / 2;
+
+	if (wait_cost > wake_cost) {
+		__sync_fetch_and_add(&nr_cost_wake_compute, 1);
+		return true;
+	}
+
+	__sync_fetch_and_add(&nr_cost_wait_lp, 1);
+	return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -658,7 +813,9 @@ static void update_tier(struct task_struct *p, struct task_ctx *tctx,
 	u8 old_tier = tctx->tier;
 	u8 new_tier = old_tier;
 	u64 burst_for_escalation = tctx->avg_burst_ns;
-	bool interactive = false;
+	bool interactive;
+	u8 requested_tier;
+	u32 credit_cost = 0;
 
 	if (tctx->force_valid) {
 		tctx->tier = tctx->force_tier;
@@ -669,14 +826,8 @@ static void update_tier(struct task_struct *p, struct task_ctx *tctx,
 	    now - tctx->first_run_at <= fast_burst_window_ns)
 		burst_for_escalation = burst_ns;
 
-	/* Interactive detection: short bursts + high wakeups/ctx-switches */
-	if (tctx->wakeup_freq >= interactive_wakeup_freq ||
-	    tctx->vol_ctx_per_sec >= interactive_csw_rate ||
-	    (burst_ns > 0 && burst_ns <= interactive_short_burst_ns &&
-	     tctx->wakeup_freq >= (interactive_wakeup_freq / 2)))
-		interactive = true;
-	if (tctx->sync_wake)
-		interactive = true;
+	refill_burst_credits(tctx, now);
+	interactive = task_interactive_signal(tctx, burst_ns);
 
 	/* Track bursty pattern within a window */
 	if (burst_for_escalation > lp_burst_thresh_ns) {
@@ -726,6 +877,23 @@ static void update_tier(struct task_struct *p, struct task_ctx *tctx,
 		__sync_fetch_and_add(&nr_interactive_promos, 1);
 	}
 
+	/* Burst credits: allow short boosts, then force drain-back cycle */
+	requested_tier = new_tier;
+	if (requested_tier > old_tier) {
+		credit_cost = (requested_tier >= TIER_P) ?
+			      burst_credit_cost_p : burst_credit_cost_e;
+
+		if (tctx->mandatory_drain) {
+			requested_tier = old_tier;
+		} else if (tctx->burst_credits >= credit_cost) {
+			tctx->burst_credits -= credit_cost;
+		} else {
+			requested_tier = old_tier;
+			tctx->mandatory_drain = 1;
+		}
+		new_tier = requested_tier;
+	}
+
 	/* CPU-bound demotion (degradable priorities) */
 	if (burst_for_escalation >= cpu_bound_burst_ns &&
 	    tctx->wakeup_freq < (interactive_wakeup_freq / 2)) {
@@ -756,6 +924,20 @@ static void update_tier(struct task_struct *p, struct task_ctx *tctx,
 		new_tier = (u8)(old_tier - 1);
 		tctx->last_quiet_at = now;  /* reset for next stage */
 		dbg("meteor: drain-back %s %d→%d", p->comm, old_tier, new_tier);
+	}
+
+	/* Mandatory drain mode after burst credit exhaustion */
+	if (tctx->mandatory_drain && old_tier > TIER_LP) {
+		u64 forced_drain_ns = drain_delay_ns / 2;
+
+		if (forced_drain_ns == 0)
+			forced_drain_ns = 1;
+		if (tctx->last_quiet_at == 0)
+			tctx->last_quiet_at = now;
+		if (now - tctx->last_quiet_at >= forced_drain_ns) {
+			new_tier = (u8)(old_tier - 1);
+			tctx->last_quiet_at = now;
+		}
 	}
 
 	/* Bursty pattern: keep at least E while in bursty hold window */
@@ -805,6 +987,9 @@ s32 BPF_STRUCT_OPS(meteor_select_cpu, struct task_struct *p,
 	struct task_ctx *tctx;
 	u8 tier;
 	s32 cpu = -EBUSY;
+	u64 now;
+	bool latency_guard;
+	bool lp_only;
 
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
@@ -814,22 +999,29 @@ s32 BPF_STRUCT_OPS(meteor_select_cpu, struct task_struct *p,
 		struct task_struct *waker = bpf_get_current_task_btf();
 		struct task_ctx *waker_ctx = try_lookup_task_ctx(waker);
 
-		tctx->sync_wake = 1;
-		if (waker_ctx && waker_ctx->tier > tctx->tier &&
-		    !tctx->force_valid) {
-			tctx->waker_tier = waker_ctx->tier;
-			tctx->waker_boost_until =
-				bpf_ktime_get_ns() + waker_boost_ns;
+			tctx->sync_wake = 1;
+			if (waker_ctx && waker_ctx->tier > tctx->tier &&
+			    !tctx->force_valid) {
+				tctx->waker_tier = waker_ctx->tier;
+				tctx->waker_boost_until =
+					bpf_ktime_get_ns() + waker_boost_ns;
+			}
 		}
-	}
 
+	now = bpf_ktime_get_ns();
+	latency_guard = latency_guard_active(tctx, now, 0);
 	update_lp_only_state();
-	tier = effective_tier(tctx, bpf_ktime_get_ns());
-	if (lp_only_active() && nr_lp_cpus > 0 &&
+	lp_only = lp_only_active();
+	tier = effective_tier(tctx, now);
+	if (lp_only && nr_lp_cpus > 0 &&
 	    !(p->flags & PF_KTHREAD) &&
 	    task_can_run_on_lp(p)) {
-		tier = TIER_LP;
-		__sync_fetch_and_add(&nr_lp_only_forced, 1);
+		if (!latency_guard) {
+			tier = TIER_LP;
+			__sync_fetch_and_add(&nr_lp_only_forced, 1);
+		} else if (tier < TIER_E) {
+			tier = TIER_E;
+		}
 	}
 
 	/*
@@ -841,7 +1033,18 @@ s32 BPF_STRUCT_OPS(meteor_select_cpu, struct task_struct *p,
 	switch (tier) {
 	case TIER_LP:
 		cpu = pick_idle_cpu_in_list(p, prev_cpu, lp_cpus, nr_lp_cpus, CORE_LP);
-		/* No fallback: LP tasks wait for LP cores → Compute tile stays off */
+		/*
+		 * Explicit cost model:
+		 * wait_on_lp vs wake_compute (+ migrate penalty).
+		 */
+		if (cpu < 0 &&
+		    should_wake_compute(tctx, prev_cpu, latency_guard, lp_only)) {
+			cpu = pick_idle_cpu_in_list(p, prev_cpu, e_cpus, nr_e_cpus, CORE_E);
+			if (cpu < 0)
+				cpu = pick_idle_cpu_in_list(p, prev_cpu, p_cpus, nr_p_cpus, CORE_P);
+			if (cpu >= 0)
+				__sync_fetch_and_add(&nr_compute_wakeups, 1);
+		}
 		break;
 
 	case TIER_E:
@@ -881,6 +1084,9 @@ void BPF_STRUCT_OPS(meteor_enqueue, struct task_struct *p, u64 enq_flags)
 	struct task_ctx *tctx;
 	u8 tier;
 	u64 dsq;
+	u64 now = bpf_ktime_get_ns();
+	bool latency_guard = false;
+	bool lp_only;
 
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx) {
@@ -903,12 +1109,23 @@ void BPF_STRUCT_OPS(meteor_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	update_lp_only_state();
-	tier = effective_tier(tctx, bpf_ktime_get_ns());
-	if (lp_only_active() && nr_lp_cpus > 0 &&
+	lp_only = lp_only_active();
+	latency_guard = latency_guard_active(tctx, now, 0);
+	tier = effective_tier(tctx, now);
+	if (lp_only && nr_lp_cpus > 0 &&
 	    !(p->flags & PF_KTHREAD) &&
 	    task_can_run_on_lp(p)) {
-		tier = TIER_LP;
-		__sync_fetch_and_add(&nr_lp_only_forced, 1);
+		if (!latency_guard) {
+			tier = TIER_LP;
+			__sync_fetch_and_add(&nr_lp_only_forced, 1);
+		} else if (tier < TIER_E) {
+			tier = TIER_E;
+		}
+	}
+	if (tier == TIER_LP &&
+	    should_wake_compute(tctx, scx_bpf_task_cpu(p), latency_guard, lp_only)) {
+		tier = TIER_E;
+		__sync_fetch_and_add(&nr_compute_wakeups, 1);
 	}
 	dsq  = tier_dsq(tier);
 
@@ -1199,6 +1416,10 @@ s32 BPF_STRUCT_OPS(meteor_init_task, struct task_struct *p,
 	tctx->burst_streak_e  = 0;
 	tctx->bursty_count    = 0;
 	tctx->bursty_window_start = 0;
+	tctx->latency_guard_until = 0;
+	tctx->burst_credit_last_refill_at = bpf_ktime_get_ns();
+	tctx->burst_credits = burst_credit_max;
+	tctx->mandatory_drain = 0;
 	tctx->procdb_loaded = 0;
 	tctx->waker_tier    = 0;
 	tctx->waker_boost_until = 0;
@@ -1214,6 +1435,14 @@ s32 BPF_STRUCT_OPS(meteor_init_task, struct task_struct *p,
 s32 BPF_STRUCT_OPS_SLEEPABLE(meteor_init)
 {
 	int err, i;
+	u32 key = 0;
+	struct objective_ctrl ctrl = {
+		.allow_compute_wake = 1,
+		.latency_pressure = 0,
+		.target_compute_wakeups_per_s = 0,
+		.epoch = 0,
+		.latency_sla_ns = latency_guard_ns,
+	};
 
 	nr_cpu_ids = scx_bpf_nr_cpu_ids();
 
@@ -1245,6 +1474,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(meteor_init)
 		scx_bpf_error("failed to create DSQ_P: %d", err);
 		return err;
 	}
+
+	bpf_map_update_elem(&objective_ctrl_map, &key, &ctrl, BPF_ANY);
 
 	return 0;
 }

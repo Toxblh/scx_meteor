@@ -56,13 +56,34 @@ pub struct Metrics {
 
     #[stat(desc = "CPU-bound demotions (degradable priorities)")]
     pub nr_cpu_bound_demotes: u64,
+
+    #[stat(desc = "Explicit wake-ups of Compute tile from LP path")]
+    pub nr_compute_wakeups: u64,
+
+    #[stat(desc = "Latency guard activations")]
+    pub nr_latency_guard_trips: u64,
+
+    #[stat(desc = "Cost-model decisions: wait_on_lp")]
+    pub nr_cost_wait_lp: u64,
+
+    #[stat(desc = "Cost-model decisions: wake_compute")]
+    pub nr_cost_wake_compute: u64,
+
+    #[stat(desc = "Cost-model migrate-cost applications")]
+    pub nr_cost_migrate: u64,
+
+    #[stat(desc = "Aggregate runnable->dispatch latency sum (ns)")]
+    pub sum_wake_latency_ns: u64,
+
+    #[stat(desc = "Samples for runnable->dispatch latency")]
+    pub nr_wake_latency_samples: u64,
 }
 
 impl Metrics {
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[scx_meteor_v2] running={:<3} LP={}/{} E={}/{} P={}/{} | esc={} drain={} procdb={} lp_only={} int_prom={} cpu_dem={}",
+            "[scx_meteor_v2] running={:<3} LP={}/{} E={}/{} P={}/{} | esc={} drain={} procdb={} lp_only={} int_prom={} cpu_dem={} cwake={} lguard={} cost(w/lp,w/c,mig)={}/{}/{}",
             self.nr_running,
             self.nr_lp_direct,
             self.nr_lp_shared,
@@ -76,6 +97,11 @@ impl Metrics {
             self.nr_lp_only_forced,
             self.nr_interactive_promos,
             self.nr_cpu_bound_demotes,
+            self.nr_compute_wakeups,
+            self.nr_latency_guard_trips,
+            self.nr_cost_wait_lp,
+            self.nr_cost_wake_compute,
+            self.nr_cost_migrate,
         )?;
         Ok(())
     }
@@ -100,6 +126,23 @@ impl Metrics {
             nr_cpu_bound_demotes: self
                 .nr_cpu_bound_demotes
                 .saturating_sub(rhs.nr_cpu_bound_demotes),
+            nr_compute_wakeups: self
+                .nr_compute_wakeups
+                .saturating_sub(rhs.nr_compute_wakeups),
+            nr_latency_guard_trips: self
+                .nr_latency_guard_trips
+                .saturating_sub(rhs.nr_latency_guard_trips),
+            nr_cost_wait_lp: self.nr_cost_wait_lp.saturating_sub(rhs.nr_cost_wait_lp),
+            nr_cost_wake_compute: self
+                .nr_cost_wake_compute
+                .saturating_sub(rhs.nr_cost_wake_compute),
+            nr_cost_migrate: self.nr_cost_migrate.saturating_sub(rhs.nr_cost_migrate),
+            sum_wake_latency_ns: self
+                .sum_wake_latency_ns
+                .saturating_sub(rhs.sum_wake_latency_ns),
+            nr_wake_latency_samples: self
+                .nr_wake_latency_samples
+                .saturating_sub(rhs.nr_wake_latency_samples),
             ..self.clone()
         }
     }
